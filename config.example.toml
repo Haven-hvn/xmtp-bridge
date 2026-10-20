@@ -1,0 +1,100 @@
+# xmtp-bridge configuration. Copy to xmtp-bridge.toml and edit.
+# Relative paths are resolved against this file's directory.
+# Secrets are referenced by file path only and must be mode 600.
+
+# User ↔ XMTP-thread map and delivery cursors (written with mode 600).
+state_path = "data/bridge-state.json"
+
+[xmtp]
+# Must match the agent's network (the dsh stack runs on production).
+env = "production"
+# The agent's Ethereum address (or XMTP inbox id).
+agent = "0x0000000000000000000000000000000000000000"
+db_path = "data/xmtp.db3"
+# The bridge's own Ethereum private key, 32 bytes hex. This is the bridge's
+# XMTP identity; it never holds funds.
+key_file = "secrets/xmtp-bridge.key"
+# 32-byte hex key encrypting the local XMTP database.
+db_key_file = "secrets/xmtp-db.key"
+# worker = "target/release/xmtp-bridge-agent"   # default: next to xmtp-bridge
+
+[signal]
+store_path = "data/signal.db3"
+# Passphrase encrypting the Signal store (SQLCipher).
+passphrase_file = "secrets/signal-store.pass"
+# Name shown under Linked devices on the bridge account's phone.
+device_name = "xmtp-bridge"
+
+# Web3 shoutbox front end: the bridge joins the shoutbox's XMTP rooms as a
+# participant (see README, "Shoutbox front end"). A room's leader adds this
+# identity's address to every group it creates, so set the shoutbox's
+# VITE_SHOUTBOX_BRIDGE_ADDRESSES to the address of `key_file` below.
+# Either front end section may be omitted; at least one is required.
+# [shoutbox]
+# # A SEPARATE Ethereum key from xmtp.key_file: this is the identity people
+# # see in rooms, while xmtp.key_file is the one that talks to the agent.
+# key_file = "secrets/shoutbox-room.key"
+# db_key_file = "secrets/shoutbox-db.key"
+# db_path = "data/shoutbox-xmtp.db3"
+# # worker = "target/release/xmtp-bridge-room"   # default: next to xmtp-bridge
+# # Lines one person may get through to the agent. Everything over it is
+# # dropped silently. Default: burst 2, 4/min.
+# per_user = { burst = 2, tokens = 4, per_secs = 60 }
+# max_tracked_users = 10000
+# # If set, only lines containing one of these words (case-insensitive) are
+# # forwarded. In a busy room most lines are not for the agent.
+# triggers = ["@agent"]
+# # Post the bridge's own notices ("slow down", "agent offline") into rooms.
+# # Off by default: in a public chat they are noise.
+# post_notices = false
+#
+# In a shoutbox the router's "sender" is the ROOM (one agent thread per
+# sliding-window group), so under [limits] `per_sender` and `xmtp_per_user`
+# are per room and `new_senders` caps how many new rooms may start an agent
+# thread. Also set `hold_while_offline = false` so the agent is not handed a
+# backlog of stale chat when it comes back.
+
+# Token buckets: `burst` actions back to back, refilled at `tokens` per
+# `per_secs` seconds. Every value below is the default.
+[limits]
+# Inbound (users → agent). Anyone may message the bridge; these are the
+# abuse controls.
+per_sender = { burst = 3, tokens = 5, per_secs = 60 }
+global = { burst = 10, tokens = 30, per_secs = 60 }
+# First messages from senders without a session (each creates an XMTP group
+# and an agent session).
+new_senders = { burst = 5, tokens = 20, per_secs = 3600 }
+# Outbound (agent → users), per network. Queued, not dropped, while empty.
+outbound_per_recipient = { burst = 3, tokens = 1, per_secs = 1 }
+outbound_global = { burst = 10, tokens = 2, per_secs = 1 }
+outbound_queue_per_recipient = 20
+outbound_queue_total = 1000
+# Calls the bridge itself makes to XMTP (opening a thread or sending), per
+# user and in total. Acts as a rate limiter on the bridge→XMTP direction;
+# denied calls are dropped with a notice, not queued.
+xmtp_per_user = { burst = 3, tokens = 5, per_secs = 60 }
+xmtp_global = { burst = 10, tokens = 30, per_secs = 60 }
+max_tracked_xmtp_users = 10000
+# Most sessions kept; the least recently active user is evicted beyond it
+# and starts a fresh agent session if they write again.
+max_sessions = 500
+max_tracked_senders = 10000
+max_message_chars = 4000
+# At most one bridge notice (e.g. "slow down") per user per window.
+notice_cooldown_secs = 60
+# Messages held while the agent link is down.
+max_inflight = 1000
+# Hold admitted messages while the agent link is down and deliver them when
+# it returns (true), or drop them with a notice (false). Live rooms want false.
+hold_while_offline = true
+
+# Optional: override any notice text the bridge sends to users.
+# [notices]
+# rate_limited = "You're sending messages faster than I can take them. Please wait a minute and try again."
+# busy = "I'm handling a lot of messages right now. Please try again in a few minutes."
+# new_sender_busy = "I can't start new conversations right now. Please try again later."
+# too_long = "That message is too long. Please keep it under {max} characters."
+# agent_unavailable = "I couldn't reach the agent just now, so your last message wasn't delivered. Please try again later."
+# still_connecting = "Still connecting you to the agent. Please wait a moment before sending more."
+# agent_offline = "The agent is offline right now. I'll pass your message on when it's back."
+# xmtp_rate_limited = "I'm relaying messages to the agent faster than XMTP allows right now. Please wait a moment and try again."

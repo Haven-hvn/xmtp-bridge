@@ -1,0 +1,23 @@
+[package]
+name = "agent-link-xmtp"
+description = "XMTP worker processes for xmtp-bridge (agent link and room member): each owns an XMTP client and speaks the bridge's JSON-lines protocol on stdin/stdout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "xmtp-bridge-agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "xmtp-bridge-room"
+path = "src/room.rs"
+
+[dependencies]
+anyhow.workspace = true
+bridge-core.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xmtp.workspace = true

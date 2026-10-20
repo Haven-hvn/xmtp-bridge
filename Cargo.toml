@@ -1,0 +1,55 @@
+[workspace]
+members = [
+    "crates/bridge-core",
+    "crates/frontend-signal",
+    "crates/frontend-shoutbox",
+    "crates/agent-link-xmtp",
+    "crates/bridge",
+]
+# `cargo build` / `cargo test` with no `-p` only touch the pure-Rust core.
+# The binaries need native dependencies; build them explicitly
+# (see README.md, "Build").
+default-members = ["crates/bridge-core", "crates/frontend-shoutbox"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+rust-version = "1.94"
+repository = "https://example.invalid/xmtp-bridge" # set when published
+
+[workspace.dependencies]
+bridge-core = { path = "crates/bridge-core" }
+frontend-signal = { path = "crates/frontend-signal" }
+frontend-shoutbox = { path = "crates/frontend-shoutbox" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "fs"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# XMTP Rust SDK (qntx-labs/xmtp). The SAME revision is built from source by
+# scripts/build-xmtp-ffi.sh; the two must always match.
+xmtp = { git = "https://github.com/qntx-labs/xmtp", rev = "a574dc9a4b54192da768deb5e398d393fd16d61f", features = ["alloy"] }
+
+# Signal (whisperfish/presage), AGPL-3.0-only.
+presage = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c" }
+
+# presage's workspace patch, mirrored here (patches only apply from the root
+# workspace, so a dependent must repeat them).
+[patch.crates-io]
+libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
+
+[profile.release]
+codegen-units = 1
+panic = "abort"
+strip = true

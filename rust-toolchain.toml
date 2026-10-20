@@ -1,0 +1,5 @@
+[toolchain]
+# Matches qntx-labs/xmtp (its SDK and xmtp-ffi pin 1.97.1). Pinned here so the
+# project never depends on the machine's global rustup default.
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]

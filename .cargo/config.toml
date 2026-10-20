@@ -1,0 +1,7 @@
+# Link xmtp-sys against libxmtp_ffi built FROM SOURCE by
+# scripts/build-xmtp-ffi.sh. Setting XMTP_FFI_DIR also stops xmtp-sys's build
+# script from downloading a prebuilt static library from GitHub Releases
+# (that download is unverified at the pinned revision: its sha256sums map is
+# empty). If the directory does not exist, linking fails closed.
+[env]
+XMTP_FFI_DIR = { value = ".deps/qntx-xmtp/xmtp-ffi/target/release", relative = true }

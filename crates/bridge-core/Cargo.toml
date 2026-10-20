@@ -1,0 +1,18 @@
+[package]
+name = "bridge-core"
+description = "Network-agnostic core of xmtp-bridge: message model, token-bucket rate limiting, session map, router, and the agent-link wire protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

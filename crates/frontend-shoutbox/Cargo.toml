@@ -1,0 +1,13 @@
+[package]
+name = "frontend-shoutbox"
+description = "Web3 shoutbox front end for xmtp-bridge: joins the shoutbox's XMTP rooms through the xmtp-bridge-room worker and forwards admitted lines to the agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bridge-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true

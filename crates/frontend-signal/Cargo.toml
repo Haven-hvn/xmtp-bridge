@@ -1,0 +1,20 @@
+[package]
+name = "frontend-signal"
+description = "Signal front end for xmtp-bridge, built on presage (linked-device client)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bridge-core.workspace = true
+futures.workspace = true
+presage.workspace = true
+presage-store-sqlite.workspace = true
+qr2term = "0.3"
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

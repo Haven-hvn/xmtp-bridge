@@ -1,0 +1,7 @@
+/target
+/.deps
+/data
+/secrets
+xmtp-bridge.toml
+*.db3
+*.db3-*

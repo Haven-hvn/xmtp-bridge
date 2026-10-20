@@ -1,0 +1,24 @@
+[package]
+name = "bridge"
+description = "xmtp-bridge: relay between messaging networks (Signal, the web3 shoutbox, …) and an XMTP agent, with token-bucket rate limiting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "xmtp-bridge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bridge-core.workspace = true
+clap.workspace = true
+frontend-shoutbox.workspace = true
+frontend-signal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
