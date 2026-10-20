@@ -114,21 +114,30 @@ fn run(args: &Args) -> anyhow::Result<()> {
     emit(&RoomEvent::Ready { inbox_id: inbox_id.clone(), address });
 
     let mut worker = Worker { client, inbox_id, members: HashMap::new() };
-    for input in rx {
-        match input {
-            Input::Request(request) => worker.handle(request),
-            Input::Streamed { message_id } => match worker.client.message_by_id(&message_id) {
+    // Sliding-window rooms are recreated every few minutes by the room
+    // leader, so re-sync periodically to discover groups created after
+    // startup; without this the bridge only ever sees startup-time groups.
+    const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    loop {
+        match rx.recv_timeout(RESYNC_INTERVAL) {
+            Ok(Input::Request(request)) => worker.handle(request),
+            Ok(Input::Streamed { message_id }) => match worker.client.message_by_id(&message_id) {
                 Ok(Some(message)) => worker.relay(&message),
                 Ok(None) => {}
                 Err(error) => log(&format!("loading message {}: {error}", short(&message_id))),
             },
             // The bridge closed our stdin: orderly shutdown.
-            Input::StdinClosed => return Ok(()),
+            Ok(Input::StdinClosed) => return Ok(()),
             // The supervisor restarts us.
-            Input::StreamEnded => bail!("XMTP message stream ended"),
+            Ok(Input::StreamEnded) => bail!("XMTP message stream ended"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = worker.client.sync_all(CONSENT) {
+                    log(&format!("periodic sync failed (continuing): {error}"));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
-    Ok(())
 }
 
 /// Most groups whose member lists are cached (a shoutbox makes a new group
