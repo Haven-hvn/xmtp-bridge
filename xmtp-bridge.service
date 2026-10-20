@@ -1,0 +1,23 @@
+[Unit]
+Description=xmtp-bridge (agent link + shoutbox room front end)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/xmtp-bridge
+ExecStart=/root/xmtp-bridge/target/release/xmtp-bridge run
+Restart=always
+RestartSec=10
+Environment=RUST_LOG=info
+
+# Hardening (bridge holds plaintext + keys; host is a trust point)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/xmtp-bridge/data /root/xmtp-bridge/secrets
+
+[Install]
+WantedBy=multi-user.target
