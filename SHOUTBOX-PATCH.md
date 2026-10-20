@@ -1,9 +1,11 @@
-# Shoutbox patch: add the bridge room identity to every leader-created group
+# Shoutbox setup: seat the bridge room identity in every leader-created group
 #
-# Context: xmtp-bridge's README says to set VITE_SHOUTBOX_BRIDGE_ADDRESSES and
-# have leaders add the bridge — but this shoutbox version never implemented
-# that variable. Without this patch, leaders create groups containing only
-# online visitors, so the bridge is never a member and never sees any lines.
+# SUPERSEDED (code part): upstream web3-shoutbox-platform commit 82bd3c2
+# ("Add configured bridge members to room groups") implemented
+# VITE_SHOUTBOX_BRIDGE_ADDRESSES natively (`src/lib/bridgeMembers.ts`,
+# wired into `createGroupAsLeader`). No patch needed on current shoutbox —
+# just configure and redeploy. The hand-written diff below is kept for
+# reference only.
 #
 # Apply on the machine that hosts the shoutbox (NOT the bridge host), then
 # rebuild/redeploy it.
