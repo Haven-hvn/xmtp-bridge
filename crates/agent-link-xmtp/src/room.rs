@@ -117,9 +117,13 @@ fn run(args: &Args) -> anyhow::Result<()> {
     // Sliding-window rooms are recreated every few minutes by the room
     // leader, so re-sync periodically to discover groups created after
     // startup; without this the bridge only ever sees startup-time groups.
+    // On XMTP rate limits the interval backs off exponentially instead of
+    // re-hammering the API every 30s and keeping the quota exhausted.
     const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    const RESYNC_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    let mut resync_interval = RESYNC_INTERVAL;
     loop {
-        match rx.recv_timeout(RESYNC_INTERVAL) {
+        match rx.recv_timeout(resync_interval) {
             Ok(Input::Request(request)) => worker.handle(request),
             Ok(Input::Streamed { message_id }) => match worker.client.message_by_id(&message_id) {
                 Ok(Some(message)) => worker.relay(&message),
@@ -131,8 +135,23 @@ fn run(args: &Args) -> anyhow::Result<()> {
             // The supervisor restarts us.
             Ok(Input::StreamEnded) => bail!("XMTP message stream ended"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(error) = worker.client.sync_all(CONSENT) {
-                    log(&format!("periodic sync failed (continuing): {error}"));
+                match worker.client.sync_all(CONSENT) {
+                    Ok(()) => resync_interval = RESYNC_INTERVAL,
+                    Err(error) => {
+                        let text = format!("{error:#}");
+                        if text.to_lowercase().contains("rate limit")
+                            || text.contains("RESOURCE_EXHAUSTED")
+                            || text.to_lowercase().contains("resource has been exhausted")
+                        {
+                            resync_interval = (resync_interval * 2).min(RESYNC_BACKOFF_MAX);
+                            log(&format!(
+                                "periodic sync rate-limited, backing off to {}s",
+                                resync_interval.as_secs()
+                            ));
+                        } else {
+                            log(&format!("periodic sync failed (continuing): {error}"));
+                        }
+                    }
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
