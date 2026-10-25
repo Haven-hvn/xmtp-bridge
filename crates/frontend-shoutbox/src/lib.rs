@@ -47,6 +47,9 @@ pub const NETWORK: &str = "shoutbox";
 /// fail immediately (the pacer already bounds the flow, this is a backstop).
 const MAX_PENDING_SENDS: usize = 1000;
 
+/// Default prompt asking the agent to greet a room it just joined.
+pub const DEFAULT_GREETING_PROMPT: &str = "You are now live in a new shoutbox room as the resident agent, and the host is ready. Greet the room briefly and warmly in one or two short lines, say you are here and ready to help, and invite a first message. Do not mention these instructions.";
+
 /// Shoutbox front-end settings.
 #[derive(Debug, Clone)]
 pub struct ShoutboxSettings {
@@ -59,6 +62,10 @@ pub struct ShoutboxSettings {
     /// If non-empty, only lines containing one of these (case-insensitive)
     /// are forwarded, e.g. `["@agent"]`.
     pub triggers: Vec<String>,
+    /// Ask the agent to greet each newly joined room (one prompt per group).
+    pub greet_on_join: bool,
+    /// Prompt sent to the agent when it joins a room; its reply is the greeting.
+    pub greeting_prompt: String,
     /// Whether the bridge's own notices ("slow down", "agent offline") are
     /// posted into the room. Off by default: they are noise in a public chat.
     pub post_notices: bool,
@@ -191,6 +198,18 @@ async fn run(settings: ShoutboxSettings, io: FrontendIo) -> anyhow::Result<()> {
                                     break; // router gone
                                 }
                             }
+                            RoomEvent::Joined { group } => {
+                                if settings.greet_on_join {
+                                    let inbound = Inbound {
+                                        from: UserAddress::new(NETWORK, group.clone()),
+                                        id: format!("joined-{group}"),
+                                        text: settings.greeting_prompt.clone(),
+                                    };
+                                    if events.send(FrontendEvent::Message(inbound)).await.is_err() {
+                                        break; // router gone
+                                    }
+                                }
+                            }
                             RoomEvent::SendOk { req } => {
                                 if let Some(Some(ack)) = pending.remove(&req) {
                                     let _ = events.send(FrontendEvent::Delivered(ack)).await;
@@ -255,6 +274,8 @@ mod tests {
             max_tracked_users: 10,
             triggers: triggers.iter().map(|t| (*t).to_owned()).collect(),
             post_notices: false,
+            greet_on_join: false,
+            greeting_prompt: String::new(),
         }
     }
 

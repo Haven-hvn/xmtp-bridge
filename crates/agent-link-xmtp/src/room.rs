@@ -52,7 +52,7 @@ enum Input {
     Streamed { message_id: String },
     StreamEnded,
     /// A new group membership arrived: sync now instead of waiting for resync.
-    NewConversation,
+    NewConversation { group: String },
 }
 
 fn main() -> ExitCode {
@@ -101,8 +101,9 @@ fn run(args: &Args) -> anyhow::Result<()> {
         Ok(conversations) => {
             let conv_tx = tx.clone();
             std::thread::Builder::new().name("xmtp-conversations".into()).spawn(move || {
-                for _conversation in conversations {
-                    if conv_tx.send(Input::NewConversation).is_err() {
+                for conversation in conversations {
+                    let group = conversation.id();
+                    if conv_tx.send(Input::NewConversation { group }).is_err() {
                         return;
                     }
                 }
@@ -133,7 +134,12 @@ fn run(args: &Args) -> anyhow::Result<()> {
     log(&format!("ready as {address} (inbox {})", short(&inbox_id)));
     emit(&RoomEvent::Ready { inbox_id: inbox_id.clone(), address });
 
-    let mut worker = Worker { client, inbox_id, members: HashMap::new() };
+    let mut worker = Worker { client, inbox_id, members: HashMap::new(), joined: std::collections::HashSet::new() };
+    // Groups surfacing in the first seconds are pre-existing memberships
+    // replayed at startup, not fresh joins — seed them silently so a
+    // bridge restart never re-greets old rooms.
+    let started = std::time::Instant::now();
+    const JOIN_ANNOUNCE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
     // Sliding-window rooms are recreated every few minutes by the room
     // leader, so re-sync periodically to discover groups created after
     // startup; without this the bridge only ever sees startup-time groups.
@@ -166,7 +172,12 @@ fn run(args: &Args) -> anyhow::Result<()> {
     };
     loop {
         match rx.recv_timeout(resync_interval) {
-            Ok(Input::NewConversation) => sync_now(&worker.client, &mut resync_interval),
+            Ok(Input::NewConversation { group }) => {
+                sync_now(&worker.client, &mut resync_interval);
+                if worker.joined.insert(group.clone()) && started.elapsed() > JOIN_ANNOUNCE_AFTER {
+                    emit(&RoomEvent::Joined { group });
+                }
+            }
             Ok(Input::Request(request)) => worker.handle(request),
             Ok(Input::Streamed { message_id }) => match worker.client.message_by_id(&message_id) {
                 Ok(Some(message)) => worker.relay(&message),
@@ -194,6 +205,8 @@ struct Worker {
     inbox_id: String,
     /// Per group: member inbox id → Ethereum address.
     members: HashMap<String, HashMap<String, String>>,
+    /// Groups already announced via `RoomEvent::Joined` (or seeded at startup).
+    joined: std::collections::HashSet<String>,
 }
 
 impl Worker {

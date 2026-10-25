@@ -56,6 +56,12 @@ pub enum RoomEvent {
         /// Plain text (non-text content is replaced by a short notice).
         text: String,
     },
+    /// The worker was added to a new group (stream-discovered, not from
+    /// the startup resync): the bridge may greet it.
+    Joined {
+        /// XMTP group id.
+        group: String,
+    },
     /// A send completed.
     SendOk {
         /// Correlation id from [`RoomRequest::Send`].

@@ -11,7 +11,7 @@ use bridge_core::pacer::OutboundLimits;
 use bridge_core::router::{Notices, RouterConfig};
 use bridge_core::secrets::{read_hex_secret, read_secret_file};
 use bridge_core::worker::WorkerSpec;
-use frontend_shoutbox::ShoutboxSettings;
+use frontend_shoutbox::{DEFAULT_GREETING_PROMPT, ShoutboxSettings};
 use frontend_signal::SignalSettings;
 use serde::Deserialize;
 
@@ -105,6 +105,16 @@ pub struct ShoutboxConfig {
     /// Post the bridge's own notices into rooms (default: no).
     #[serde(default)]
     pub post_notices: bool,
+    /// Ask the agent to greet each newly joined room (default: yes).
+    #[serde(default = "default_true")]
+    pub greet_on_join: bool,
+    /// Prompt for the join greeting; empty uses the built-in default.
+    #[serde(default)]
+    pub greeting_prompt: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_shoutbox_db() -> PathBuf {
@@ -379,6 +389,12 @@ impl Config {
             max_tracked_users: s.max_tracked_users,
             triggers: s.triggers.clone(),
             post_notices: s.post_notices,
+            greet_on_join: s.greet_on_join,
+            greeting_prompt: if s.greeting_prompt.trim().is_empty() {
+                DEFAULT_GREETING_PROMPT.to_owned()
+            } else {
+                s.greeting_prompt.clone()
+            },
         })
     }
 
