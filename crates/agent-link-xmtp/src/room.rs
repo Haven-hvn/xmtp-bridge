@@ -51,6 +51,8 @@ enum Input {
     StdinClosed,
     Streamed { message_id: String },
     StreamEnded,
+    /// A new group membership arrived: sync now instead of waiting for resync.
+    NewConversation,
 }
 
 fn main() -> ExitCode {
@@ -91,6 +93,24 @@ fn run(args: &Args) -> anyhow::Result<()> {
         let _ = stream_tx.send(Input::StreamEnded);
     })?;
 
+    // Push-driven discovery: a welcome for a group we were just added to
+    // triggers an immediate sync instead of waiting out the resync poll.
+    // Failure to start or end is not fatal — the periodic resync below
+    // remains as the backup path.
+    match xmtp::stream::conversations(&client, Some(ConversationType::Group)) {
+        Ok(conversations) => {
+            let conv_tx = tx.clone();
+            std::thread::Builder::new().name("xmtp-conversations".into()).spawn(move || {
+                for _conversation in conversations {
+                    if conv_tx.send(Input::NewConversation).is_err() {
+                        return;
+                    }
+                }
+            })?;
+        }
+        Err(error) => log(&format!("conversation stream unavailable (polling only): {error}")),
+    }
+
     std::thread::Builder::new().name("stdin".into()).spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -122,8 +142,31 @@ fn run(args: &Args) -> anyhow::Result<()> {
     const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const RESYNC_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut resync_interval = RESYNC_INTERVAL;
+    // One sync attempt with rate-limit backoff; shared by the poll timer
+    // and push-driven discovery.
+    let sync_now = |client: &Client, interval: &mut std::time::Duration| {
+        match client.sync_all(CONSENT) {
+            Ok(_) => *interval = RESYNC_INTERVAL,
+            Err(error) => {
+                let text = format!("{error:#}");
+                if text.to_lowercase().contains("rate limit")
+                    || text.contains("RESOURCE_EXHAUSTED")
+                    || text.to_lowercase().contains("resource has been exhausted")
+                {
+                    *interval = (*interval * 2).min(RESYNC_BACKOFF_MAX);
+                    log(&format!(
+                        "periodic sync rate-limited, backing off to {}s",
+                        interval.as_secs()
+                    ));
+                } else {
+                    log(&format!("periodic sync failed (continuing): {error}"));
+                }
+            }
+        }
+    };
     loop {
         match rx.recv_timeout(resync_interval) {
+            Ok(Input::NewConversation) => sync_now(&worker.client, &mut resync_interval),
             Ok(Input::Request(request)) => worker.handle(request),
             Ok(Input::Streamed { message_id }) => match worker.client.message_by_id(&message_id) {
                 Ok(Some(message)) => worker.relay(&message),
@@ -135,24 +178,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
             // The supervisor restarts us.
             Ok(Input::StreamEnded) => bail!("XMTP message stream ended"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                match worker.client.sync_all(CONSENT) {
-                    Ok(()) => resync_interval = RESYNC_INTERVAL,
-                    Err(error) => {
-                        let text = format!("{error:#}");
-                        if text.to_lowercase().contains("rate limit")
-                            || text.contains("RESOURCE_EXHAUSTED")
-                            || text.to_lowercase().contains("resource has been exhausted")
-                        {
-                            resync_interval = (resync_interval * 2).min(RESYNC_BACKOFF_MAX);
-                            log(&format!(
-                                "periodic sync rate-limited, backing off to {}s",
-                                resync_interval.as_secs()
-                            ));
-                        } else {
-                            log(&format!("periodic sync failed (continuing): {error}"));
-                        }
-                    }
-                }
+                sync_now(&worker.client, &mut resync_interval)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
