@@ -212,10 +212,21 @@ struct Worker {
 impl Worker {
     fn handle(&self, request: RoomRequest) {
         match request {
-            RoomRequest::Send { req, group, text } => match self.send(&group, &text) {
-                Ok(()) => emit(&RoomEvent::SendOk { req }),
-                Err(error) => emit(&RoomEvent::SendFailed { req, error: format!("{error:#}") }),
-            },
+            RoomRequest::Send { req, group, text } => {
+                // Name every post before the blocking XMTP call so a wedge
+                // is a visible stuck operation, not silence.
+                log(&format!("posting req {req} to group {} ({} chars)", short(&group), text.len()));
+                match self.send(&group, &text) {
+                    Ok(()) => {
+                        log(&format!("posted req {req} to group {}", short(&group)));
+                        emit(&RoomEvent::SendOk { req })
+                    }
+                    Err(error) => {
+                        log(&format!("post req {req} to group {} failed: {error:#}", short(&group)));
+                        emit(&RoomEvent::SendFailed { req, error: format!("{error:#}") })
+                    }
+                }
+            }
         }
     }
 

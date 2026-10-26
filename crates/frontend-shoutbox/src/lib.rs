@@ -155,7 +155,15 @@ async fn run(settings: ShoutboxSettings, io: FrontendIo) -> anyhow::Result<()> {
     let mut admission = Admission::new(&settings);
     let mut ready: Option<u64> = None;
     let mut next_req = 1_u64;
-    let mut pending: HashMap<u64, Option<DeliveryAck>> = HashMap::new();
+    // In-flight room posts, with the target group so a failed reply can
+    // be answered with a failure notice in the right room.
+    #[derive(Debug)]
+    struct PendingSend {
+        ack: Option<DeliveryAck>,
+        group: String,
+        is_notice: bool,
+    }
+    let mut pending: HashMap<u64, PendingSend> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -177,7 +185,7 @@ async fn run(settings: ShoutboxSettings, io: FrontendIo) -> anyhow::Result<()> {
                             ready = None;
                         }
                         // Replies in flight to a dead worker are lost; say so.
-                        for ack in pending.drain().filter_map(|(_, ack)| ack) {
+                        for ack in pending.drain().filter_map(|(_, p)| p.ack) {
                             let reason = "room worker restarted".to_owned();
                             let _ = events.send(FrontendEvent::Failed { ack, reason }).await;
                         }
@@ -211,14 +219,39 @@ async fn run(settings: ShoutboxSettings, io: FrontendIo) -> anyhow::Result<()> {
                                 }
                             }
                             RoomEvent::SendOk { req } => {
-                                if let Some(Some(ack)) = pending.remove(&req) {
-                                    let _ = events.send(FrontendEvent::Delivered(ack)).await;
+                                if let Some(done) = pending.remove(&req) {
+                                    tracing::info!(req, group = %short(&done.group), "posted to room");
+                                    if let Some(ack) = done.ack {
+                                        let _ = events.send(FrontendEvent::Delivered(ack)).await;
+                                    }
                                 }
                             }
                             RoomEvent::SendFailed { req, error } => {
                                 tracing::warn!(req, %error, "posting to the room failed");
-                                if let Some(Some(ack)) = pending.remove(&req) {
-                                    let _ = events.send(FrontendEvent::Failed { ack, reason: error }).await;
+                                if let Some(failed) = pending.remove(&req) {
+                                    if let Some(ack) = failed.ack {
+                                        let _ = events.send(FrontendEvent::Failed { ack, reason: error }).await;
+                                    }
+                                    // A failed reply must not be silent in
+                                    // the room: one short failure notice,
+                                    // never for a failed notice itself.
+                                    if !failed.is_notice && let Some(generation) = ready {
+                                        let notice_req = next_req;
+                                        next_req += 1;
+                                        pending.insert(notice_req, PendingSend {
+                                            ack: None,
+                                            group: failed.group.clone(),
+                                            is_notice: true,
+                                        });
+                                        let request = RoomRequest::Send {
+                                            req: notice_req,
+                                            group: failed.group,
+                                            text: "The agent's reply could not be posted here — please try again.".to_owned(),
+                                        };
+                                        if request_tx.send(Tagged { generation, request }).await.is_err() {
+                                            anyhow::bail!("room worker supervisor stopped");
+                                        }
+                                    }
                                 }
                             }
                             RoomEvent::Fatal { error } => tracing::error!(%error, "room worker reported a fatal error"),
@@ -243,7 +276,8 @@ async fn run(settings: ShoutboxSettings, io: FrontendIo) -> anyhow::Result<()> {
                 };
                 let req = next_req;
                 next_req += 1;
-                pending.insert(req, ack);
+                tracing::info!(req, group = %short(&to.user), "posting reply to room");
+                pending.insert(req, PendingSend { ack, group: to.user.clone(), is_notice: false });
                 let request = RoomRequest::Send { req, group: to.user, text };
                 if request_tx.send(Tagged { generation, request }).await.is_err() {
                     anyhow::bail!("room worker supervisor stopped");
