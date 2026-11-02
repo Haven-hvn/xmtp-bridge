@@ -138,7 +138,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
     log(&format!("ready as {address} (inbox {})", short(&inbox_id)));
     emit(&RoomEvent::Ready { inbox_id: inbox_id.clone(), address });
 
-    let mut worker = Worker { client, inbox_id, members: HashMap::new(), joined: std::collections::HashSet::new() };
+    let mut worker = Worker { client, inbox_id, members: HashMap::new(), joined: std::collections::HashSet::new(), seen: std::collections::HashSet::new() };
     // Groups surfacing in the first seconds are pre-existing memberships
     // replayed at startup, not fresh joins — seed them silently so a
     // bridge restart never re-greets old rooms.
@@ -200,7 +200,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
             // The supervisor restarts us.
             Ok(Input::StreamEnded) => bail!("XMTP message stream ended"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                sync_now(&worker.client, &mut resync_interval)
+                sync_now(&worker.client, &mut resync_interval);
+                worker.backfill();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
@@ -218,6 +219,8 @@ struct Worker {
     members: HashMap<String, HashMap<String, String>>,
     /// Groups already announced via `RoomEvent::Joined` (or seeded at startup).
     joined: std::collections::HashSet<String>,
+    /// Message ids already relayed (stream + backfill dedup).
+    seen: std::collections::HashSet<String>,
 }
 
 impl Worker {
@@ -248,8 +251,35 @@ impl Worker {
         Ok(())
     }
 
+    /// Relay recent history the live stream missed (post-restart or
+    /// undiscovered groups). Deduped via `seen`, shared with the stream.
+    fn backfill(&mut self) {
+        // Announced groups (joined) plus any group with cached members.
+        let mut groups: Vec<String> = self.joined.iter().cloned().collect();
+        for group in self.members.keys() {
+            if !self.joined.contains(group) {
+                groups.push(group.clone());
+            }
+        }
+        for group in groups {
+            let Ok(Some(conversation)) = self.client.conversation(&group) else { continue };
+            let Ok(messages) = conversation.messages() else { continue };
+            let recent: Vec<&Message> = messages.iter().rev().take(25).collect();
+            for message in recent.into_iter().rev() {
+                self.relay(message);
+            }
+        }
+    }
+
     /// Forward one message written by someone else; everything else is ignored.
     fn relay(&mut self, message: &Message) {
+        if !self.seen.insert(message.id.clone()) {
+            return; // already relayed (stream/backfill overlap)
+        }
+        if self.seen.len() > 5_000 {
+            self.seen.clear();
+            self.seen.insert(message.id.clone());
+        }
         if message.sender_inbox_id == self.inbox_id || message.kind != MessageKind::Application {
             return;
         }
