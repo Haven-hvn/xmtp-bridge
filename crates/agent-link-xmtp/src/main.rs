@@ -124,8 +124,20 @@ fn run(args: &Args) -> anyhow::Result<()> {
         match input {
             Input::Request(request) => worker.handle(request),
             Input::Streamed { message_id } => match worker.client.message_by_id(&message_id) {
-                Ok(Some(message)) => worker.relay(&message),
-                Ok(None) => {}
+                Ok(Some(message)) => {
+                    log(&format!(
+                        "agent event {} in {}",
+                        short(&message.id),
+                        short(&message.conversation_id)
+                    ));
+                    worker.relay(&message);
+                }
+                Ok(None) => {
+                    log(&format!(
+                        "agent event {} not found after stream delivery",
+                        short(&message_id)
+                    ));
+                }
                 Err(error) => log(&format!("loading message {}: {error}", short(&message_id))),
             },
             // The bridge closed our stdin: orderly shutdown.
@@ -158,17 +170,56 @@ impl Worker {
     fn handle(&self, request: AgentRequest) {
         match request {
             AgentRequest::OpenThread { req } => {
+                // Opening while rate-limited wedges silently in the FFI:
+                // sync welcomes first (cheap), log an outcome for every open.
+                if let Err(error) = self.client.sync_welcomes() {
+                    log(&format!(
+                        "pre-open welcome-sync failed for req {req} (continuing): {error:#}"
+                    ));
+                }
                 let options =
                     CreateGroupOptions { permissions: Some(GroupPermissionsPreset::AdminOnly), ..Default::default() };
-                match self.client.group(&[Recipient::InboxId(self.agent_inbox_id.clone())], &options) {
-                    Ok(conversation) => emit(&AgentEvent::Opened { req, thread: conversation.id() }),
-                    Err(error) => emit(&AgentEvent::OpenFailed { req, error: error.to_string() }),
+                match self
+                    .client
+                    .group(
+                        &[Recipient::InboxId(self.agent_inbox_id.clone())],
+                        &options,
+                    ) {
+                    Ok(conversation) => {
+                        log(&format!(
+                            "agent thread opened: {}",
+                            short(&conversation.id())
+                        ));
+                        emit(&AgentEvent::Opened {
+                            req,
+                            thread: conversation.id(),
+                        });
+                    }
+                    Err(error) => {
+                        log(&format!("agent thread open failed: {error:#}"));
+                        emit(&AgentEvent::OpenFailed {
+                            req,
+                            error: error.to_string(),
+                        });
+                    }
                 }
             }
-            AgentRequest::Send { req, thread, text } => match self.send(&thread, &text) {
-                Ok(()) => emit(&AgentEvent::SendOk { req }),
-                Err(error) => emit(&AgentEvent::SendFailed { req, error: format!("{error:#}") }),
-            },
+            AgentRequest::Send { req, thread, text } => {
+                log(&format!("agent delivery send req {req}"));
+                match self.send(&thread, &text) {
+                    Ok(()) => {
+                        log(&format!("agent delivery sent req {req}"));
+                        emit(&AgentEvent::SendOk { req })
+                    }
+                    Err(error) => {
+                        log(&format!("agent delivery failed: {error:#}"));
+                        emit(&AgentEvent::SendFailed {
+                            req,
+                            error: format!("{error:#}"),
+                        })
+                    }
+                }
+            }
             AgentRequest::Resume { threads } => {
                 for cursor in threads {
                     if let Err(error) = self.resume(&cursor) {
