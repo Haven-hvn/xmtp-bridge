@@ -107,6 +107,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
                         return;
                     }
                 }
+                // Stream ended: bail via StreamEnded so the supervisor
+                // restarts us with fresh streams instead of leaving
+                // discovery silently dead.
+                let _ = conv_tx.send(Input::StreamEnded);
             })?;
         }
         Err(error) => log(&format!("conversation stream unavailable (polling only): {error}")),
@@ -145,7 +149,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
     // startup; without this the bridge only ever sees startup-time groups.
     // On XMTP rate limits the interval backs off exponentially instead of
     // re-hammering the API every 30s and keeping the quota exhausted.
-    const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    // Full syncs are expensive (every accumulated window group is
+    // checked) and were the rate-limit sink: the conversations stream is
+    // the primary discovery path now, so the full resync is a slow backup.
+    const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
     const RESYNC_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut resync_interval = RESYNC_INTERVAL;
     // One sync attempt with rate-limit backoff; shared by the poll timer
@@ -173,7 +180,11 @@ fn run(args: &Args) -> anyhow::Result<()> {
     loop {
         match rx.recv_timeout(resync_interval) {
             Ok(Input::NewConversation { group }) => {
-                sync_now(&worker.client, &mut resync_interval);
+                // Cheap targeted welcome sync (not sync_all): process the
+                // new invitation without re-checking every dead window group.
+                if let Err(error) = worker.client.sync_welcomes() {
+                    log(&format!("welcome sync failed (continuing): {error}"));
+                }
                 if worker.joined.insert(group.clone()) && started.elapsed() > JOIN_ANNOUNCE_AFTER {
                     emit(&RoomEvent::Joined { group });
                 }
