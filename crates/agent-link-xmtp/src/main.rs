@@ -119,8 +119,21 @@ fn run(args: &Args) -> anyhow::Result<()> {
     log(&format!("ready as {address} (inbox {}), agent inbox {}", short(&inbox_id), short(&agent_inbox_id)));
     emit(&AgentEvent::Ready { inbox_id, address, agent_inbox_id: agent_inbox_id.clone() });
 
-    let worker = Worker { client, agent_inbox_id };
-    for input in rx {
+    let mut worker = Worker {
+        client,
+        agent_inbox_id,
+        threads: std::collections::HashSet::new(),
+        seen: std::collections::HashSet::new(),
+    };
+    loop {
+        let input = match rx.recv_timeout(BACKFILL_INTERVAL) {
+            Ok(input) => input,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                worker.backfill();
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
         match input {
             Input::Request(request) => worker.handle(request),
             Input::Streamed { message_id } => match worker.client.message_by_id(&message_id) {
@@ -130,6 +143,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
                         short(&message.id),
                         short(&message.conversation_id)
                     ));
+                    worker.threads.insert(message.conversation_id.clone());
                     worker.relay(&message);
                 }
                 Ok(None) => {
@@ -161,13 +175,35 @@ fn resolve_agent(client: &Client, agent: &str) -> anyhow::Result<String> {
     }
 }
 
+/// How often known agent threads are re-synced and backfilled. The live
+/// stream can hang open while delivering nothing (a zombie stream never
+/// ends, so the supervisor's stream-end restart never fires); this makes
+/// reply loss a delay of at most one interval instead of silence.
+const BACKFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
 struct Worker {
     client: Client,
     agent_inbox_id: String,
+    /// Agent threads opened, resumed, or seen on the stream.
+    threads: std::collections::HashSet<String>,
+    /// Message ids already relayed (stream + backfill dedup).
+    seen: std::collections::HashSet<String>,
+}
+
+/// True the first time an id is marked seen; false for repeats.
+fn first_seen(seen: &mut std::collections::HashSet<String>, id: &str) -> bool {
+    if !seen.insert(id.to_string()) {
+        return false;
+    }
+    if seen.len() > 5_000 {
+        seen.clear();
+        seen.insert(id.to_string());
+    }
+    true
 }
 
 impl Worker {
-    fn handle(&self, request: AgentRequest) {
+    fn handle(&mut self, request: AgentRequest) {
         match request {
             AgentRequest::OpenThread { req } => {
                 // Opening while rate-limited wedges silently in the FFI:
@@ -186,6 +222,7 @@ impl Worker {
                         &options,
                     ) {
                     Ok(conversation) => {
+                        self.threads.insert(conversation.id());
                         log(&format!(
                             "agent thread opened: {}",
                             short(&conversation.id())
@@ -222,6 +259,7 @@ impl Worker {
             }
             AgentRequest::Resume { threads } => {
                 for cursor in threads {
+                    self.threads.insert(cursor.thread.clone());
                     if let Err(error) = self.resume(&cursor) {
                         log(&format!("resume {}: {error:#}", short(&cursor.thread)));
                     }
@@ -237,7 +275,29 @@ impl Worker {
         Ok(())
     }
 
-    fn resume(&self, cursor: &ResumeCursor) -> anyhow::Result<()> {
+    /// Relay recent agent replies the live stream missed. Runs on the
+    /// recv-timeout tick; per-thread sync pulls what a zombie stream never
+    /// delivered, and `seen` dedups against stream deliveries.
+    fn backfill(&mut self) {
+        if let Err(error) = self.client.sync_welcomes() {
+            log(&format!("backfill welcome-sync failed (continuing): {error:#}"));
+        }
+        let threads: Vec<String> = self.threads.iter().cloned().collect();
+        for thread in threads {
+            let Ok(Some(conversation)) = self.client.conversation(&thread) else { continue };
+            if let Err(error) = conversation.sync() {
+                log(&format!("backfill sync {} failed (continuing): {error:#}", short(&thread)));
+                continue;
+            }
+            let Ok(messages) = conversation.messages() else { continue };
+            let recent: Vec<&Message> = messages.iter().rev().take(25).collect();
+            for message in recent.into_iter().rev() {
+                self.relay(message);
+            }
+        }
+    }
+
+    fn resume(&mut self, cursor: &ResumeCursor) -> anyhow::Result<()> {
         let Some(conversation) = self.client.conversation(&cursor.thread)? else {
             bail!("unknown thread");
         };
@@ -255,7 +315,10 @@ impl Worker {
     }
 
     /// Forward one agent message to the bridge; everything else is ignored.
-    fn relay(&self, message: &Message) {
+    fn relay(&mut self, message: &Message) {
+        if !first_seen(&mut self.seen, &message.id) {
+            return; // already relayed (stream/backfill overlap)
+        }
         if message.sender_inbox_id != self.agent_inbox_id || message.kind != MessageKind::Application {
             return;
         }
@@ -273,4 +336,21 @@ impl Worker {
 
 fn log(text: &str) {
     eprintln!("xmtp-bridge-agent: {text}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_seen;
+    use std::collections::HashSet;
+
+    #[test]
+    fn backfill_dedup_relays_a_missed_reply_once() {
+        let mut seen = HashSet::new();
+        // Stream delivered this one; backfill must not relay it again.
+        assert!(first_seen(&mut seen, "streamed-1"));
+        assert!(!first_seen(&mut seen, "streamed-1"));
+        // Stream missed this reply; backfill relays it exactly once.
+        assert!(first_seen(&mut seen, "missed-1"));
+        assert!(!first_seen(&mut seen, "missed-1"));
+    }
 }

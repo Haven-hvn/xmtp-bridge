@@ -155,6 +155,13 @@ fn run(args: &Args) -> anyhow::Result<()> {
     const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
     const RESYNC_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut resync_interval = RESYNC_INTERVAL;
+    // Cheap discovery tick, independent of the expensive full sync: pull
+    // welcomes (one API call) and scan the local conversation list for
+    // groups neither stream has surfaced. The full sync stays a slow
+    // backup and may sit in rate-limit backoff for 30 minutes; discovery
+    // of a fresh room must not wait for it.
+    const DISCOVER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut last_full_sync = std::time::Instant::now();
     // One sync attempt with rate-limit backoff; shared by the poll timer
     // and push-driven discovery.
     let sync_now = |client: &Client, interval: &mut std::time::Duration| {
@@ -178,7 +185,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
         }
     };
     loop {
-        match rx.recv_timeout(resync_interval) {
+        match rx.recv_timeout(DISCOVER_INTERVAL) {
             Ok(Input::NewConversation { group }) => {
                 // Cheap targeted welcome sync (not sync_all): process the
                 // new invitation without re-checking every dead window group.
@@ -191,7 +198,16 @@ fn run(args: &Args) -> anyhow::Result<()> {
             }
             Ok(Input::Request(request)) => worker.handle(request),
             Ok(Input::Streamed { message_id }) => match worker.client.message_by_id(&message_id) {
-                Ok(Some(message)) => worker.relay(&message),
+                Ok(Some(message)) => {
+                    // A message in a group discovery never announced is
+                    // still a join: announce it or the room gets no greeting.
+                    if worker.joined.insert(message.conversation_id.clone())
+                        && started.elapsed() > JOIN_ANNOUNCE_AFTER
+                    {
+                        emit(&RoomEvent::Joined { group: message.conversation_id.clone() });
+                    }
+                    worker.relay(&message);
+                }
                 Ok(None) => {}
                 Err(error) => log(&format!("loading message {}: {error}", short(&message_id))),
             },
@@ -200,8 +216,12 @@ fn run(args: &Args) -> anyhow::Result<()> {
             // The supervisor restarts us.
             Ok(Input::StreamEnded) => bail!("XMTP message stream ended"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                sync_now(&worker.client, &mut resync_interval);
-                worker.backfill();
+                worker.discover(started.elapsed() > JOIN_ANNOUNCE_AFTER);
+                if last_full_sync.elapsed() >= resync_interval {
+                    sync_now(&worker.client, &mut resync_interval);
+                    last_full_sync = std::time::Instant::now();
+                }
+                worker.backfill(started.elapsed() > JOIN_ANNOUNCE_AFTER);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
@@ -251,9 +271,30 @@ impl Worker {
         Ok(())
     }
 
+    /// Discover groups neither stream surfaced: sync welcomes (cheap),
+    /// then scan the local conversation list. New groups are announced
+    /// exactly like stream-discovered ones.
+    fn discover(&mut self, announce: bool) {
+        if let Err(error) = self.client.sync_welcomes() {
+            log(&format!("discovery welcome-sync failed (continuing): {error:#}"));
+            return;
+        }
+        let Ok(conversations) = self.client.conversations() else { return };
+        for conversation in conversations {
+            let group = conversation.id();
+            if is_new_group(&self.joined, &self.members, &group) {
+                self.joined.insert(group.clone());
+                if announce {
+                    log(&format!("discovered group {} via welcome sync", short(&group)));
+                    emit(&RoomEvent::Joined { group });
+                }
+            }
+        }
+    }
+
     /// Relay recent history the live stream missed (post-restart or
     /// undiscovered groups). Deduped via `seen`, shared with the stream.
-    fn backfill(&mut self) {
+    fn backfill(&mut self, announce: bool) {
         // Announced groups (joined) plus any group with cached members.
         let mut groups: Vec<String> = self.joined.iter().cloned().collect();
         for group in self.members.keys() {
@@ -262,6 +303,10 @@ impl Worker {
             }
         }
         for group in groups {
+            // Backfill reaching a group discovery missed is a join too.
+            if self.joined.insert(group.clone()) && announce {
+                emit(&RoomEvent::Joined { group: group.clone() });
+            }
             let Ok(Some(conversation)) = self.client.conversation(&group) else { continue };
             let Ok(messages) = conversation.messages() else { continue };
             let recent: Vec<&Message> = messages.iter().rev().take(25).collect();
@@ -329,4 +374,30 @@ impl Worker {
 
 fn log(text: &str) {
     eprintln!("xmtp-bridge-room: {text}");
+}
+
+/// A group is new when neither the joined set nor the member cache has
+/// seen it; both are populated by stream discovery and by `discover`.
+fn is_new_group(
+    joined: &std::collections::HashSet<String>,
+    members: &HashMap<String, HashMap<String, String>>,
+    group: &str,
+) -> bool {
+    !joined.contains(group) && !members.contains_key(group)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_new_group;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn welcome_discovery_only_announces_unseen_groups() {
+        let joined: HashSet<String> = ["g-stream".to_string()].into_iter().collect();
+        let mut members: HashMap<String, HashMap<String, String>> = HashMap::new();
+        members.insert("g-cached".to_string(), HashMap::new());
+        assert!(!is_new_group(&joined, &members, "g-stream"));
+        assert!(!is_new_group(&joined, &members, "g-cached"));
+        assert!(is_new_group(&joined, &members, "g-fresh"));
+    }
 }
