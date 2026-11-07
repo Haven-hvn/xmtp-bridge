@@ -117,6 +117,18 @@ pub struct ShoutboxConfig {
     /// anything other than this deployment's frontend are ignored entirely.
     #[serde(default)]
     pub allowed_rooms: Vec<String>,
+    /// Human-presence snapshot the join greeting is gated on (default:
+    /// none, i.e. greet a room whether or not anyone is in it). Written by
+    /// the deployment's `bridge-presence.mjs`; relative paths resolve
+    /// against this file's directory like every other path.
+    #[serde(default)]
+    pub greet_presence_file: PathBuf,
+    /// Seconds a snapshot timestamp may age before its room counts as
+    /// empty (default: 45 — heartbeats arrive every 10 s, die after 30 s,
+    /// and the snapshot itself is rewritten every heartbeat). Zero never
+    /// greets.
+    #[serde(default = "default_greet_presence_ttl")]
+    pub greet_presence_ttl_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -133,6 +145,10 @@ const fn default_shoutbox_per_user() -> Rate {
 
 const fn default_shoutbox_tracked_users() -> usize {
     10_000
+}
+
+const fn default_greet_presence_ttl() -> u64 {
+    45
 }
 
 /// Every limit, with defaults.
@@ -307,6 +323,11 @@ impl Config {
             s.key_file = abs(&s.key_file);
             s.db_key_file = abs(&s.db_key_file);
             s.worker = s.worker.as_deref().map(abs);
+            // An empty presence file is the gate's off switch; joining it
+            // against the config directory would turn "off" into a path.
+            if !s.greet_presence_file.as_os_str().is_empty() {
+                s.greet_presence_file = abs(&s.greet_presence_file);
+            }
             s
         });
         if let Some(s) = &shoutbox {
@@ -402,6 +423,8 @@ impl Config {
                 s.greeting_prompt.clone()
             },
             allowed_rooms: s.allowed_rooms.clone(),
+            greet_presence_file: (!s.greet_presence_file.as_os_str().is_empty()).then(|| s.greet_presence_file.clone()),
+            greet_presence_ttl: std::time::Duration::from_secs(s.greet_presence_ttl_secs),
         })
     }
 
@@ -594,5 +617,49 @@ mod tests {
         assert!(parse(&zero).is_err());
         let typo = format!("{MINIMAL}\n[limits]\nper_sendr = {{ burst = 1, tokens = 1, per_secs = 1 }}\n");
         assert!(parse(&typo).is_err(), "unknown keys are rejected");
+    }
+
+    #[test]
+    fn presence_gate_is_off_unless_configured() {
+        let text = r#"
+            [xmtp]
+            env = "production"
+            agent = "0xa85dD3FbD8C2c831Ef156036F14638CcFf03b44e"
+            key_file = "secrets/evm.key"
+            db_key_file = "secrets/db.key"
+
+            [shoutbox]
+            key_file = "secrets/room.key"
+            db_key_file = "secrets/room-db.key"
+            worker = "/bin/true"
+        "#;
+        let c = parse(text).unwrap();
+        let s = c.shoutbox.as_ref().unwrap();
+        assert!(s.greet_presence_file.as_os_str().is_empty(), "no snapshot configured");
+        assert_eq!(s.greet_presence_ttl_secs, 45, "default freshness window");
+        let settings = c.shoutbox_settings().unwrap();
+        assert!(
+            settings.greet_presence_file.is_none(),
+            "an empty path stays empty — joining it would turn the off switch into a directory"
+        );
+
+        // A relative snapshot path resolves against the config file, and an
+        // absolute one is kept as written.
+        let rel = text
+            .replace("worker = \"/bin/true\"", "worker = \"/bin/true\"\ngreet_presence_file = \"data/presence.json\"");
+        let c = parse(&rel).unwrap();
+        assert_eq!(c.shoutbox.as_ref().unwrap().greet_presence_file, PathBuf::from("/srv/bridge/data/presence.json"));
+        let abs = text
+            .replace("worker = \"/bin/true\"", "worker = \"/bin/true\"\ngreet_presence_file = \"/var/presence.json\"");
+        assert_eq!(
+            parse(&abs).unwrap().shoutbox.as_ref().unwrap().greet_presence_file,
+            PathBuf::from("/var/presence.json")
+        );
+
+        // A zero window never counts a heartbeat as fresh: it is a way of
+        // saying "greet no one" without turning greet_on_join off.
+        let zero = text.replace("worker = \"/bin/true\"", "worker = \"/bin/true\"\ngreet_presence_ttl_secs = 0");
+        let settings = parse(&zero).unwrap().shoutbox_settings().unwrap();
+        assert_eq!(settings.greet_presence_ttl, std::time::Duration::ZERO);
     }
 }

@@ -55,6 +55,19 @@ device_name = "xmtp-bridge"
 # # VITE_ALLOWED_ROOMS exactly: both sides compare the same normalized URL,
 # # character for character.
 # allowed_rooms = ["https://shoutbox.pinme.dev/default"]
+# # Join-greeting presence gate (default: off). greet_on_join announces the
+# # agent in every room it joins — one prompt per room, plus one per rejoin
+# # after a bridge restart — whether or not anyone is there. Point this at
+# # the snapshot the deployment's bridge-presence.mjs writes (roomKey ->
+# # unix-ms of each room's freshest human heartbeat) and the greeting goes
+# # out only while a human is actually in the room: a missing, unreadable
+# # or stale snapshot means no greeting, never a guessed one. The roomKey
+# # is sha256 hex of the normalized room URL — the frontend's own room key.
+# greet_presence_file = "/var/lib/bridge-presence/presence.json"
+# # How old (seconds) a heartbeat may be and still count as a person
+# # online (default 45: heartbeats arrive every 10 s, die after 30 s, and
+# # the snapshot itself is written every heartbeat). 0 never greets.
+# greet_presence_ttl_secs = 45
 #
 # In a shoutbox the router's "sender" is the ROOM (one agent thread per
 # sliding-window group), so under [limits] `per_sender` and `xmtp_per_user`

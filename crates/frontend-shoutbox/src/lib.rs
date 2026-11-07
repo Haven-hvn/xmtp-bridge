@@ -5,8 +5,10 @@
 //! "sliding window"). The leader adds every online participant's address to
 //! the group, and with `VITE_SHOUTBOX_BRIDGE_ADDRESSES` set, this front end's
 //! address too. The bridge is then a member like anyone else, through the
-//! `xmtp-bridge-room` worker process. It needs nothing from the shoutbox's
-//! GunDB presence layer: XMTP group membership is the ground truth.
+//! `xmtp-bridge-room` worker process. Relaying chat needs nothing from the
+//! shoutbox's GunDB presence layer — XMTP group membership is the ground
+//! truth — but the join greeting does, so the agent never announces itself
+//! to an empty room: see [`PresenceGate`].
 //!
 //! ## Who is the "user"?
 //!
@@ -39,9 +41,22 @@
 //! address anyone can add to a group of their own, and because the frontend
 //! has more than one way to end up in a room nobody meant to open.
 //!
+//! ## Who is in the room?
+//!
+//! [`ShoutboxSettings::greet_on_join`] makes the agent announce itself in
+//! every room it joins — one prompt per room, plus one per rejoin after a
+//! bridge restart — whether or not anyone is there. With
+//! [`ShoutboxSettings::greet_presence_file`] set, [`PresenceGate`] spends
+//! those prompts only while a human is actually present: the deployment's
+//! `bridge-presence.mjs` mirrors live GunDB heartbeats into a snapshot
+//! file, and a missing, unreadable or stale snapshot means no greeting.
+//! Left unset, the gate is off and every allowed room is greeted as
+//! before.
+//!
 //! [web3 shoutbox]: ../../web3-shoutbox-platform-main
 use std::collections::HashMap;
-use std::time::Instant;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bridge_core::bucket::{KeyedBuckets, Rate};
 use bridge_core::message::{
@@ -49,6 +64,7 @@ use bridge_core::message::{
 };
 use bridge_core::room_protocol::{RoomEvent, RoomRequest};
 use bridge_core::worker::{Tagged, WorkerInput, WorkerSpec, supervise};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 /// Network id used in [`UserAddress::network`].
@@ -77,6 +93,11 @@ pub struct ShoutboxSettings {
     pub greet_on_join: bool,
     /// Prompt sent to the agent when it joins a room; its reply is the greeting.
     pub greeting_prompt: String,
+    /// Presence snapshot the join greeting is gated on; `None` (the
+    /// default) greets every allowed room whether or not anyone is in it.
+    pub greet_presence_file: Option<PathBuf>,
+    /// How young a snapshot timestamp must be to count as a human online.
+    pub greet_presence_ttl: Duration,
     /// Whether the bridge's own notices ("slow down", "agent offline") are
     /// posted into the room. Off by default: they are noise in a public chat.
     pub post_notices: bool,
@@ -186,6 +207,121 @@ impl Admission {
     }
 }
 
+/// Version stamped into every presence snapshot this bridge understands.
+const PRESENCE_SNAPSHOT_VERSION: u32 = 1;
+
+/// Gate for the join greeting on actual human presence.
+///
+/// The frontend keeps a GunDB heartbeat per participant — fresh for 30 s,
+/// rewritten every 10 — and the Rust bridge never talks to Gun. The
+/// deployment's `bridge-presence.mjs`, which already runs a Gun client to
+/// keep its own heartbeat alive, mirrors those heartbeats into a JSON
+/// snapshot, and this gate reads that file at the moment the bridge joins
+/// a room. The snapshot's shape is [`PresenceSnapshot`].
+///
+/// With no file configured ([`ShoutboxSettings::greet_presence_file`])
+/// the gate is off and every allowed room is greeted, as before. With one
+/// configured, absence of evidence counts as absence of people: a
+/// missing, unreadable or stale snapshot suppresses the greeting, so an
+/// empty room never costs a prompt — and neither does a bridge restart
+/// rejoining every window it remembers.
+#[derive(Debug, Clone)]
+pub struct PresenceGate {
+    /// Snapshot file to read; `None` disables the gate.
+    file: Option<PathBuf>,
+    /// How young a timestamp in it must be to count as a human online.
+    ttl: Duration,
+}
+
+impl PresenceGate {
+    /// The gate `settings` describes.
+    #[must_use]
+    pub fn from_settings(settings: &ShoutboxSettings) -> Self {
+        Self { file: settings.greet_presence_file.clone(), ttl: settings.greet_presence_ttl }
+    }
+
+    /// Whether the join greeting may go out for `group`.
+    ///
+    /// Silent when it allows, and silent when no gate is configured;
+    /// every refusal logs its reason, so a room the agent stayed quiet in
+    /// is always explainable from the log alone.
+    #[must_use]
+    pub fn allows_greeting(&self, group: &str, group_name: Option<&str>) -> bool {
+        let Some(path) = &self.file else {
+            return true; // no gate configured: greet as this bridge always did
+        };
+        let Some(room_name) = group_name else {
+            // A nameless group cannot be matched to any room's heartbeats.
+            tracing::info!(group = %short(group), "no room name to look up presence; not greeting");
+            return false;
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+        let ttl_ms = u64::try_from(self.ttl.as_millis()).unwrap_or(u64::MAX);
+        let verdict = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))
+            .and_then(|text| Self::fresh_in(&text, &room_key(room_name), now_ms, ttl_ms));
+        match verdict {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::info!(group = %short(group), name = %room_name, "no human presence in the room; not greeting");
+                false
+            }
+            Err(error) => {
+                tracing::warn!(group = %short(group), path = %path.display(), %error, "presence snapshot unusable; not greeting");
+                false
+            }
+        }
+    }
+
+    /// Read a snapshot: does `room_key` hold a heartbeat younger than
+    /// `ttl_ms` at `now_ms`?
+    ///
+    /// # Errors
+    /// The snapshot is not JSON this bridge understands or carries a
+    /// version it does not know. Either way the caller stays quiet,
+    /// because guessing at a stale snapshot is the exact failure this
+    /// gate exists to prevent.
+    fn fresh_in(snapshot: &str, room_key: &str, now_ms: u64, ttl_ms: u64) -> anyhow::Result<bool> {
+        let parsed: PresenceSnapshot = serde_json::from_str(snapshot)?;
+        anyhow::ensure!(
+            parsed.version == PRESENCE_SNAPSHOT_VERSION,
+            "unsupported presence snapshot version {} (want {PRESENCE_SNAPSHOT_VERSION})",
+            parsed.version
+        );
+        Ok(parsed.rooms.get(room_key).is_some_and(|ts| *ts > 0 && now_ms.saturating_sub(*ts) < ttl_ms))
+    }
+}
+
+/// What `bridge-presence.mjs` writes: a versioned map from room key (the
+/// frontend's GunDB key — sha256 hex of the normalized room URL, which is
+/// exactly what it stamps into a group's XMTP name) to the unix-ms
+/// timestamp of that room's freshest human heartbeat.
+///
+/// A room at `0` was tracked but has never had a human in it; a room
+/// absent from the map was never seen at all. Both read as "empty", so a
+/// snapshot that stopped updating simply ages out.
+#[derive(Debug, serde::Deserialize)]
+struct PresenceSnapshot {
+    /// Format version; an unknown one is refused rather than guessed at.
+    version: u32,
+    /// Room key -> unix-ms of the freshest human heartbeat.
+    #[serde(default)]
+    rooms: HashMap<String, u64>,
+}
+
+/// The frontend's GunDB room key for `room_name`: sha256 hex of the
+/// normalized room URL, so hashing the name back reproduces the key its
+/// heartbeats live under. Like [`Admission::room_allowed`] this
+/// deliberately does not re-normalize — matching what it is given is the
+/// bridge's job, normalizing is the frontend's.
+fn room_key(room_name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(room_name.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 async fn run(settings: ShoutboxSettings, io: FrontendIo) -> anyhow::Result<()> {
     let FrontendIo { events, mut outbound, mut shutdown } = io;
     let (request_tx, request_rx) = mpsc::channel::<Tagged<RoomRequest>>(1024);
@@ -193,6 +329,7 @@ async fn run(settings: ShoutboxSettings, io: FrontendIo) -> anyhow::Result<()> {
     let mut supervisor = tokio::spawn(supervise(settings.worker.clone(), request_rx, input_tx, shutdown.clone()));
 
     let mut admission = Admission::new(&settings);
+    let presence = PresenceGate::from_settings(&settings);
     let mut ready: Option<u64> = None;
     let mut next_req = 1_u64;
     // In-flight room posts, with the target group so a failed reply can
@@ -266,7 +403,15 @@ async fn run(settings: ShoutboxSettings, io: FrontendIo) -> anyhow::Result<()> {
                                     );
                                     continue;
                                 }
-                                if settings.greet_on_join {
+                                // The presence gate has its own log line
+                                // for why it stayed silent, so a quiet
+                                // join is always explainable.
+                                if settings.greet_on_join && presence.allows_greeting(&group, group_name.as_deref()) {
+                                    tracing::info!(
+                                        group = %short(&group),
+                                        name = group_name.as_deref().unwrap_or("<unnamed>"),
+                                        "human presence in the room; greeting"
+                                    );
                                     let inbound = Inbound {
                                         from: UserAddress::new(NETWORK, group.clone()),
                                         id: format!("joined-{group}"),
@@ -356,8 +501,6 @@ fn short(id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     fn settings(triggers: &[&str]) -> ShoutboxSettings {
@@ -373,6 +516,8 @@ mod tests {
             post_notices: false,
             greet_on_join: false,
             greeting_prompt: String::new(),
+            greet_presence_file: None,
+            greet_presence_ttl: Duration::from_secs(45),
             allowed_rooms: allowed_rooms.iter().map(|r| (*r).to_owned()).collect(),
         }
     }
@@ -389,16 +534,93 @@ mod tests {
 
         let pinned = Admission::new(&settings_in(&[], &[ROOM]));
         assert!(pinned.room_allowed(Some(ROOM)), "the room itself");
-        assert!(
-            !pinned.room_allowed(Some("https://shoutbox.pinme.dev/general")),
-            "a room outside the list"
-        );
+        assert!(!pinned.room_allowed(Some("https://shoutbox.pinme.dev/general")), "a room outside the list");
         assert!(
             !pinned.room_allowed(Some("https://shoutbox.pinme.dev/default/")),
             "exact match only: normalizing is the frontend's job, not the bridge's"
         );
         assert!(!pinned.room_allowed(None), "an unnamed group is not the allowed room");
         assert!(!pinned.room_allowed(Some("")), "an empty name is not a match");
+    }
+
+    /// Wall-clock milliseconds — the clock the snapshot writer runs on.
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0))
+    }
+
+    fn snapshot_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("xmtp-bridge-presence-{name}-{}.json", std::process::id()))
+    }
+
+    #[test]
+    fn room_key_is_the_frontends_room_key() {
+        assert_eq!(
+            room_key("https://shoutbox.pinme.dev/default"),
+            "f3a65fc278b0ed45ef55b5d7eb8870059b28555e8cbab040b050e8881aee3d91",
+            "sha256 hex of the normalized room URL, exactly as the frontend hashes it"
+        );
+    }
+
+    #[test]
+    fn presence_gate_is_off_until_a_snapshot_is_configured() {
+        let gate = PresenceGate::from_settings(&settings(&[]));
+        assert!(gate.allows_greeting("group-1", Some("https://shoutbox.pinme.dev/default")));
+        assert!(gate.allows_greeting("group-1", None), "no gate means no questions");
+    }
+
+    #[test]
+    fn presence_gate_greets_only_while_a_human_heartbeat_is_fresh() {
+        const ROOM: &str = "https://shoutbox.pinme.dev/default";
+        let path = snapshot_path("gated");
+        let key = room_key(ROOM);
+        let now = now_ms();
+        let gate = PresenceGate { file: Some(path.clone()), ttl: Duration::from_secs(45) };
+        let write = |body: String| std::fs::write(&path, body).expect("write the snapshot");
+
+        // A heartbeat from seconds ago: the room has someone in it.
+        write(format!(r#"{{"version":1,"rooms":{{"{key}":{now}}}}}"#));
+        assert!(gate.allows_greeting("g", Some(ROOM)), "a fresh heartbeat is a person");
+
+        // One window past the TTL: the heartbeat is dead, so is the room.
+        write(format!(r#"{{"version":1,"rooms":{{"{key}":{}}}}}"#, now - 46_000));
+        assert!(!gate.allows_greeting("g", Some(ROOM)), "a stale heartbeat is an empty room");
+
+        // Tracked but never visited, and never tracked at all: both empty.
+        write(format!(r#"{{"version":1,"rooms":{{"{key}":0}}}}"#));
+        assert!(!gate.allows_greeting("g", Some(ROOM)), "0 means never seen a human");
+        write(format!(r#"{{"version":1,"rooms":{{"some-other-room":{now}}}}}"#));
+        assert!(!gate.allows_greeting("g", Some(ROOM)), "a room the writer never saw");
+
+        // Nothing to read, nothing to parse, nothing this bridge knows:
+        // each refuses rather than guessing a greeting.
+        std::fs::remove_file(&path).expect("remove the snapshot");
+        assert!(!gate.allows_greeting("g", Some(ROOM)), "a missing snapshot");
+        write("not json at all".to_owned());
+        assert!(!gate.allows_greeting("g", Some(ROOM)), "an unparsable snapshot");
+        write(format!(r#"{{"version":2,"rooms":{{"{key}":{now}}}}}"#));
+        assert!(!gate.allows_greeting("g", Some(ROOM)), "an unknown snapshot version");
+
+        // A group with no room name cannot be matched to any heartbeats.
+        write(format!(r#"{{"version":1,"rooms":{{"{key}":{now}}}}}"#));
+        assert!(!gate.allows_greeting("g", None), "no room name, no greeting");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn presence_snapshot_freshness_counts_exactly() {
+        let json = r#"{"version":1,"rooms":{"k":100000}}"#;
+        assert!(PresenceGate::fresh_in(json, "k", 144_999, 45_000).expect("fresh"));
+        assert!(!PresenceGate::fresh_in(json, "k", 145_000, 45_000).expect("parsed"), "exactly ttl old is stale");
+        assert!(!PresenceGate::fresh_in(json, "other", 100_001, 45_000).expect("parsed"), "a different room");
+        assert!(
+            !PresenceGate::fresh_in(r#"{"version":1,"rooms":{"k":0}}"#, "k", u64::MAX, 45_000).expect("parsed"),
+            "0 is the writer's never-seen-a-human marker"
+        );
+        assert!(
+            PresenceGate::fresh_in(r#"{"rooms":{"k":100000}}"#, "k", 100_001, 45_000).is_err(),
+            "a snapshot with no version is refused, not assumed"
+        );
     }
 
     #[test]
