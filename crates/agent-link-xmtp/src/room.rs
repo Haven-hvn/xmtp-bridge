@@ -138,7 +138,14 @@ fn run(args: &Args) -> anyhow::Result<()> {
     log(&format!("ready as {address} (inbox {})", short(&inbox_id)));
     emit(&RoomEvent::Ready { inbox_id: inbox_id.clone(), address });
 
-    let mut worker = Worker { client, inbox_id, members: HashMap::new(), joined: std::collections::HashSet::new(), seen: std::collections::HashSet::new() };
+    let mut worker = Worker {
+        client,
+        inbox_id,
+        members: HashMap::new(),
+        names: HashMap::new(),
+        joined: std::collections::HashSet::new(),
+        seen: std::collections::HashSet::new(),
+    };
     // Groups surfacing in the first seconds are pre-existing memberships
     // replayed at startup, not fresh joins — seed them silently so a
     // bridge restart never re-greets old rooms.
@@ -193,7 +200,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
                     log(&format!("welcome sync failed (continuing): {error}"));
                 }
                 if worker.joined.insert(group.clone()) && started.elapsed() > JOIN_ANNOUNCE_AFTER {
-                    emit(&RoomEvent::Joined { group });
+                    let group_name = worker.group_name(&group);
+                    emit(&RoomEvent::Joined { group, group_name });
                 }
             }
             Ok(Input::Request(request)) => worker.handle(request),
@@ -204,7 +212,9 @@ fn run(args: &Args) -> anyhow::Result<()> {
                     if worker.joined.insert(message.conversation_id.clone())
                         && started.elapsed() > JOIN_ANNOUNCE_AFTER
                     {
-                        emit(&RoomEvent::Joined { group: message.conversation_id.clone() });
+                        let group = message.conversation_id.clone();
+                        let group_name = worker.group_name(&group);
+                        emit(&RoomEvent::Joined { group, group_name });
                     }
                     worker.relay(&message);
                 }
@@ -237,6 +247,13 @@ struct Worker {
     inbox_id: String,
     /// Per group: member inbox id → Ethereum address.
     members: HashMap<String, HashMap<String, String>>,
+    /// Per group: its XMTP name, once read. The shoutbox stamps the room URL
+    /// into the name when the leader creates a group, so this is how the
+    /// bridge learns which room a group is. Names are cached because every
+    /// relayed line would otherwise re-read group metadata; a group with no
+    /// name yet is *not* cached, so a metadata update that arrives later is
+    /// picked up on the next message rather than being remembered as absent.
+    names: HashMap<String, String>,
     /// Groups already announced via `RoomEvent::Joined` (or seeded at startup).
     joined: std::collections::HashSet<String>,
     /// Message ids already relayed (stream + backfill dedup).
@@ -286,7 +303,8 @@ impl Worker {
                 self.joined.insert(group.clone());
                 if announce {
                     log(&format!("discovered group {} via welcome sync", short(&group)));
-                    emit(&RoomEvent::Joined { group });
+                    let group_name = self.group_name(&group);
+                    emit(&RoomEvent::Joined { group, group_name });
                 }
             }
         }
@@ -305,7 +323,8 @@ impl Worker {
         for group in groups {
             // Backfill reaching a group discovery missed is a join too.
             if self.joined.insert(group.clone()) && announce {
-                emit(&RoomEvent::Joined { group: group.clone() });
+                let group_name = self.group_name(&group);
+                emit(&RoomEvent::Joined { group: group.clone(), group_name });
             }
             let Ok(Some(conversation)) = self.client.conversation(&group) else { continue };
             let Ok(messages) = conversation.messages() else { continue };
@@ -330,6 +349,7 @@ impl Worker {
         }
         let Some(text) = text_of(message, "[sent an attachment]") else { return };
         let sender_address = self.address_of(&message.conversation_id, &message.sender_inbox_id);
+        let group_name = self.group_name(&message.conversation_id);
         emit(&RoomEvent::Message {
             group: message.conversation_id.clone(),
             id: message.id.clone(),
@@ -337,7 +357,35 @@ impl Worker {
             sender_address,
             sent_at_ns: message.sent_at_ns,
             text,
+            group_name,
         });
+    }
+
+    /// The group's XMTP name: the room URL the shoutbox's leader stamped
+    /// into the group when it created it, and the only thing the bridge can
+    /// match a group against to tell which room it is.
+    ///
+    /// Found names are cached, since every relayed line would otherwise
+    /// re-read group metadata. A group with no name yet is *not* cached, so
+    /// metadata that arrives after the group does is picked up on the next
+    /// message instead of being remembered as absent forever.
+    fn group_name(&mut self, group: &str) -> Option<String> {
+        if let Some(name) = self.names.get(group) {
+            return Some(name.clone());
+        }
+        let name = match self.client.conversation(group) {
+            Ok(Some(conversation)) => conversation.name(),
+            Ok(None) => return None,
+            Err(error) => {
+                log(&format!("reading the name of {}: {error}", short(group)));
+                return None;
+            }
+        }?;
+        if self.names.len() >= MAX_CACHED_GROUPS && !self.names.contains_key(group) {
+            self.names.clear();
+        }
+        self.names.insert(group.to_owned(), name.clone());
+        Some(name)
     }
 
     /// The sender's address from the group's member list, refreshing the

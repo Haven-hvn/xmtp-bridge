@@ -55,12 +55,23 @@ pub enum RoomEvent {
         sent_at_ns: i64,
         /// Plain text (non-text content is replaced by a short notice).
         text: String,
+        /// The group's XMTP name. The shoutbox sets it to the room URL when
+        /// the leader creates a group, and it is the only thing on this wire
+        /// that says which room the group belongs to — the room key never
+        /// crosses into the bridge. `None` when the group is unnamed or its
+        /// metadata has not synced yet.
+        #[serde(default)]
+        group_name: Option<String>,
     },
     /// The worker was added to a new group (stream-discovered, not from
     /// the startup resync): the bridge may greet it.
     Joined {
         /// XMTP group id.
         group: String,
+        /// The group's XMTP name, as in [`RoomEvent::Message::group_name`].
+        /// The bridge refuses to greet a room outside its allowlist.
+        #[serde(default)]
+        group_name: Option<String>,
     },
     /// A send completed.
     SendOk {
@@ -96,7 +107,7 @@ mod tests {
         let line = serde_json::to_string(&RoomRequest::Send { req: 3, group: "g".into(), text: "hi".into() }).unwrap();
         assert_eq!(line, r#"{"op":"send","req":3,"group":"g","text":"hi"}"#);
         let event: RoomEvent = serde_json::from_str(
-            r#"{"ev":"message","group":"g","id":"m","sender_inbox_id":"s","sender_address":null,"sent_at_ns":5,"text":"yo"}"#,
+            r#"{"ev":"message","group":"g","id":"m","sender_inbox_id":"s","sender_address":null,"sent_at_ns":5,"text":"yo","group_name":"https://shoutbox.pinme.dev/default"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -108,7 +119,23 @@ mod tests {
                 sender_address: None,
                 sent_at_ns: 5,
                 text: "yo".into(),
+                group_name: Some("https://shoutbox.pinme.dev/default".into()),
             }
+        );
+        // A worker that predates the room name still deserializes: the field
+        // defaults to `None`, which the bridge then treats as not allowed.
+        let unnamed: RoomEvent = serde_json::from_str(
+            r#"{"ev":"message","group":"g","id":"m","sender_inbox_id":"s","sender_address":null,"sent_at_ns":5,"text":"yo"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(unnamed, RoomEvent::Message { group_name: None, .. }),
+            "a missing group_name must not be a protocol error"
+        );
+        assert!(
+            serde_json::from_str::<RoomEvent>(r#"{"ev":"joined","group":"g"}"#)
+                .is_ok_and(|joined| matches!(joined, RoomEvent::Joined { group_name: None, .. })),
+            "a missing group_name on Joined must not be a protocol error"
         );
         assert!(RoomEvent::Ready { inbox_id: "i".into(), address: "0x1".into() }.is_ready());
         assert!(!event.is_ready());

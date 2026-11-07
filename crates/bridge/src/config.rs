@@ -111,6 +111,12 @@ pub struct ShoutboxConfig {
     /// Prompt for the join greeting; empty uses the built-in default.
     #[serde(default)]
     pub greeting_prompt: String,
+    /// Room names the bridge serves — the normalized room URL the shoutbox
+    /// writes into each group's XMTP name. Empty (the default) serves every
+    /// room; a non-empty list serves only those, so groups opened by
+    /// anything other than this deployment's frontend are ignored entirely.
+    #[serde(default)]
+    pub allowed_rooms: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -395,6 +401,7 @@ impl Config {
             } else {
                 s.greeting_prompt.clone()
             },
+            allowed_rooms: s.allowed_rooms.clone(),
         })
     }
 

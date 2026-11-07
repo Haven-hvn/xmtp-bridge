@@ -69,6 +69,12 @@ pub struct ShoutboxSettings {
     /// Whether the bridge's own notices ("slow down", "agent offline") are
     /// posted into the room. Off by default: they are noise in a public chat.
     pub post_notices: bool,
+    /// Room names the bridge serves, exactly as the frontend stamps them
+    /// into a group's XMTP name (the normalized room URL). Empty means
+    /// every room, which is the default so an unconfigured bridge keeps its
+    /// old behavior; otherwise only an exact match is served and every other
+    /// group — including unnamed ones — is ignored.
+    pub allowed_rooms: Vec<String>,
 }
 
 /// The shoutbox front end.
@@ -101,6 +107,7 @@ impl Frontend for ShoutboxFrontend {
 pub struct Admission {
     per_user: KeyedBuckets<String>,
     triggers: Vec<String>,
+    allowed_rooms: std::collections::HashSet<String>,
 }
 
 impl Admission {
@@ -110,12 +117,34 @@ impl Admission {
         Self {
             per_user: KeyedBuckets::new(settings.per_user, settings.max_tracked_users),
             triggers: settings.triggers.iter().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect(),
+            allowed_rooms: settings.allowed_rooms.iter().cloned().collect(),
         }
+    }
+
+    /// Whether the bridge serves the room a group belongs to.
+    ///
+    /// A group says which room it is only through its XMTP name: the
+    /// frontend's leader writes the normalized room URL into the name when
+    /// it creates the group, and the room worker reports it back here. The
+    /// room key itself never reaches the bridge, and group ids rotate with
+    /// every sliding window, so the name is the one stable thing to match.
+    ///
+    /// This is a policy filter, not a security boundary — XMTP group names
+    /// are unsigned, so anyone can create a group named like an allowed one
+    /// and add the bridge's public address to it. It exists to stop rooms
+    /// being opened by accident.
+    #[must_use]
+    pub fn room_allowed(&self, group_name: Option<&str>) -> bool {
+        self.allowed_rooms.is_empty() || group_name.is_some_and(|name| self.allowed_rooms.contains(name))
     }
 
     /// Turn a room message into an [`Inbound`] for the router, or `None` to
     /// drop it. Checks the trigger words first (free), then the sender's
     /// bucket, so chatter never spends anyone's tokens.
+    ///
+    /// The room allowlist is deliberately *not* applied here: it is a gate
+    /// on the room, checked once per event before this, so a disallowed room
+    /// costs no bucket lookup and cannot spend a sender's tokens.
     pub fn admit(
         &mut self,
         group: &str,
@@ -196,7 +225,18 @@ async fn run(settings: ShoutboxSettings, io: FrontendIo) -> anyhow::Result<()> {
                             continue;
                         }
                         match event {
-                            RoomEvent::Message { group, id, sender_inbox_id, sender_address, text, .. } => {
+                            RoomEvent::Message { group, id, sender_inbox_id, sender_address, text, group_name, .. } => {
+                                // Room gate first: an unsolicited room costs
+                                // nothing at all — no bucket lookup, and no
+                                // chance of spending the sender's tokens.
+                                if !admission.room_allowed(group_name.as_deref()) {
+                                    tracing::debug!(
+                                        group = %short(&group),
+                                        name = group_name.as_deref().unwrap_or("<unnamed>"),
+                                        "room outside allowed_rooms; dropping"
+                                    );
+                                    continue;
+                                }
                                 let admitted = admission.admit(
                                     &group, &id, &sender_inbox_id, sender_address.as_deref(), &text, Instant::now(),
                                 );
@@ -206,7 +246,15 @@ async fn run(settings: ShoutboxSettings, io: FrontendIo) -> anyhow::Result<()> {
                                     break; // router gone
                                 }
                             }
-                            RoomEvent::Joined { group } => {
+                            RoomEvent::Joined { group, group_name } => {
+                                if !admission.room_allowed(group_name.as_deref()) {
+                                    tracing::info!(
+                                        group = %short(&group),
+                                        name = group_name.as_deref().unwrap_or("<unnamed>"),
+                                        "joined a room outside allowed_rooms; not greeting"
+                                    );
+                                    continue;
+                                }
                                 if settings.greet_on_join {
                                     let inbound = Inbound {
                                         from: UserAddress::new(NETWORK, group.clone()),
@@ -302,6 +350,10 @@ mod tests {
     use super::*;
 
     fn settings(triggers: &[&str]) -> ShoutboxSettings {
+        settings_in(triggers, &[])
+    }
+
+    fn settings_in(triggers: &[&str], allowed_rooms: &[&str]) -> ShoutboxSettings {
         ShoutboxSettings {
             worker: WorkerSpec { program: "/bin/true".into(), args: Vec::new() },
             per_user: Rate::new(2, 1, 60),
@@ -310,7 +362,32 @@ mod tests {
             post_notices: false,
             greet_on_join: false,
             greeting_prompt: String::new(),
+            allowed_rooms: allowed_rooms.iter().map(|r| (*r).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn only_allowed_rooms_are_served() {
+        const ROOM: &str = "https://shoutbox.pinme.dev/default";
+
+        // No allowlist configured: the bridge keeps serving every room it
+        // is added to, named or not.
+        let open = Admission::new(&settings(&[]));
+        assert!(open.room_allowed(None), "an unconfigured bridge serves unnamed rooms");
+        assert!(open.room_allowed(Some("https://shoutbox.pinme.dev/general")));
+
+        let pinned = Admission::new(&settings_in(&[], &[ROOM]));
+        assert!(pinned.room_allowed(Some(ROOM)), "the room itself");
+        assert!(
+            !pinned.room_allowed(Some("https://shoutbox.pinme.dev/general")),
+            "a room outside the list"
+        );
+        assert!(
+            !pinned.room_allowed(Some("https://shoutbox.pinme.dev/default/")),
+            "exact match only: normalizing is the frontend's job, not the bridge's"
+        );
+        assert!(!pinned.room_allowed(None), "an unnamed group is not the allowed room");
+        assert!(!pinned.room_allowed(Some("")), "an empty name is not a match");
     }
 
     #[test]

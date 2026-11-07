@@ -47,6 +47,14 @@ device_name = "xmtp-bridge"
 # # Post the bridge's own notices ("slow down", "agent offline") into rooms.
 # # Off by default: in a public chat they are noise.
 # post_notices = false
+# # Room names the bridge serves — the normalized room URL the shoutbox's
+# # leader writes into each group's XMTP name at creation. Empty (the
+# # default) serves every room; a list serves only those, so a group opened
+# # by anything other than this deployment's frontend is ignored entirely
+# # (no agent thread, no join greeting). Match the frontend's
+# # VITE_ALLOWED_ROOMS exactly: both sides compare the same normalized URL,
+# # character for character.
+# allowed_rooms = ["https://shoutbox.pinme.dev/default"]
 #
 # In a shoutbox the router's "sender" is the ROOM (one agent thread per
 # sliding-window group), so under [limits] `per_sender` and `xmtp_per_user`
