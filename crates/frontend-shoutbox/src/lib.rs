@@ -28,6 +28,17 @@
 //! later: when the room worker is down, pending replies fail and the router
 //! moves on. Pair it with `limits.hold_while_offline = false`.
 //!
+//! ## Which rooms?
+//!
+//! A room group only ever says which room it is through its XMTP name — the
+//! frontend writes the normalized room URL there when its leader creates the
+//! group, and the room worker reports it back on every event. When
+//! [`ShoutboxSettings::allowed_rooms`] is set, anything else is dropped
+//! before it can reach the router, and no join greeting is sent: see
+//! [`Admission::room_allowed`]. That matters because the bridge is a public
+//! address anyone can add to a group of their own, and because the frontend
+//! has more than one way to end up in a room nobody meant to open.
+//!
 //! [web3 shoutbox]: ../../web3-shoutbox-platform-main
 use std::collections::HashMap;
 use std::time::Instant;
