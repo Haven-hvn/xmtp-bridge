@@ -24,18 +24,18 @@ bridge-core = { path = "crates/bridge-core" }
 frontend-signal = { path = "crates/frontend-signal" }
 frontend-shoutbox = { path = "crates/frontend-shoutbox" }
 
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-futures = "0.3"
-hex = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-thiserror = "2"
-tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "fs"] }
-toml = "0.9"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0.105"
+clap = { version = "4.6.10", features = ["derive"] }
+futures = "0.3.34"
+hex = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.2"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "fs"] }
+toml = "1.2.3+spec-1.1.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # XMTP Rust SDK (qntx-labs/xmtp). The SAME revision is built from source by
 # scripts/build-xmtp-ffi.sh; the two must always match.
